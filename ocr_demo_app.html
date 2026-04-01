@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HPC Tiny Model Demo</title>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    
+    
+    <style>
+        :root { --bg: #1e1e2e; --surface: #2a2a3f; --text: #cdd6f4; --accent: #cba6f7; --canvas-bg: #ffffff; }
+        body { font-family: -apple-system, sans-serif; background-color: var(--bg); color: var(--text); display: flex; flex-direction: column; align-items: center; padding: 2rem; margin: 0; min-height: 100vh; }
+        .container { background: var(--surface); padding: 2rem; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); max-width: 600px; width: 100%; display: flex; flex-direction: column; align-items: center; gap: 1.5rem; }
+        h1 { margin: 0; font-size: 1.8rem; color: var(--accent); }
+        .upload-section { width: 100%; text-align: center; padding: 1rem; border: 2px dashed #6c7086; border-radius: 8px; }
+        input[type="file"] { color: var(--text); font-family: inherit; }
+
+        .canvas-container {
+            position: relative;
+            width: 252px; /* 28 * 9px cells */
+            height: 252px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            border-radius: 4px;
+            overflow: hidden;
+            background-color: var(--canvas-bg);
+            cursor: none; 
+        }
+        
+        canvas { width: 100%; height: 100%; image-rendering: pixelated; }
+
+        .grid-overlay {
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+            pointer-events: none;
+            background-image:
+                linear-gradient(to right, rgba(0,0,0,0.08) 1px, transparent 1px),
+                linear-gradient(to bottom, rgba(0,0,0,0.08) 1px, transparent 1px);
+            background-size: 9px 9px;
+        }
+
+        /* The cursor overlay - now a snapped circle */
+        #brushCursor {
+            position: absolute;
+            border-radius: 50%; /* Circle shape */
+            background-color: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(0, 0, 0, 0.9);
+            box-sizing: border-box;
+            pointer-events: none;
+            display: none;
+            z-index: 10;
+        }
+
+        .controls { display: flex; gap: 1rem; }
+        button { background: var(--accent); color: #11111b; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-weight: bold; cursor: pointer; transition: opacity 0.2s; }
+        button:hover { opacity: 0.8; }
+
+        .results-grid { width: 100%; display: flex; justify-content: space-between; gap: 0.5rem; margin-top: 1rem; height: 120px; align-items: flex-end; }
+        .result-bar-container { display: flex; flex-direction: column; align-items: center; width: 9%; }
+        .prob-label { font-family: 'Space Mono', monospace; font-size: 0.7rem; margin-bottom: 4px; color: #a6adc8; opacity: 0; transition: opacity 0.3s; }
+        .bar { width: 100%; background: var(--accent); height: 0px; border-radius: 4px 4px 0 0; transition: height 0.1s ease-out; }
+        .char-label { font-family: 'Space Mono', monospace; font-size: 1.5rem; margin-top: 8px; color: var(--text); }
+        #status { font-size: 0.9rem; color: #f38ba8; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>HPC Tiny OCR Demo</h1>
+    
+    <div class="upload-section">
+        <label for="modelUpload">Load `browser_checkpoint_best.onnx`</label><br><br>
+        <input type="file" id="modelUpload" accept=".onnx">
+        <div id="status">Waiting for model...</div>
+    </div>
+
+    <div class="canvas-container" id="canvasContainer">
+        <canvas id="drawCanvas" width="28" height="28"></canvas>
+        <div class="grid-overlay"></div>
+        <div id="brushCursor"></div>
+    </div>
+
+    <div class="controls">
+        <button id="clearBtn">Clear Canvas</button>
+        <span style="font-size: 0.8rem; color: #6c7086; margin-left: 1rem; align-self: center;">Left Click: Draw &nbsp;|&nbsp; Right Click: Erase</span>
+    </div>
+
+    <div class="results-grid" id="resultsGrid"></div>
+</div>
+
+<script>
+    const CLASSES = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabdefghnqrt".split('');
+    const CANVAS_SIZE = 28;
+    const CSS_SIZE = 252;
+    const SCALE = CSS_SIZE / CANVAS_SIZE; // 9px per grid block
+    
+    // Smooth dithering brush sizes
+    const BRUSH_WIDTH = 2.0; 
+    const ERASER_WIDTH = 4.0;
+
+    let session = null;
+    let isDrawing = false;
+    let lastInferenceTime = 0;
+    
+    // Float coordinates for smooth drawing
+    let lastX = 0;
+    let lastY = 0;
+    
+    const canvas = document.getElementById('drawCanvas');
+    const container = document.getElementById('canvasContainer');
+    const brushCursor = document.getElementById('brushCursor');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    
+    ctx.fillStyle = "white";
+    ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+
+    const resultsGrid = document.getElementById('resultsGrid');
+    for(let i=0; i<10; i++) {
+        const div = document.createElement('div');
+        div.className = 'result-bar-container';
+        div.innerHTML = `<div class="prob-label" id="prob-${i}">0%</div><div class="bar" id="bar-${i}"></div><div class="char-label" id="char-${i}">-</div>`;
+        resultsGrid.appendChild(div);
+    }
+
+    document.getElementById('modelUpload').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const statusEl = document.getElementById('status');
+        try {
+            statusEl.style.color = "#89dceb"; statusEl.innerText = "Loading model...";
+            session = await ort.InferenceSession.create(await file.arrayBuffer());
+            statusEl.style.color = "#a6e3a1"; statusEl.innerText = "Model loaded successfully!";
+        } catch (err) {
+            statusEl.style.color = "#f38ba8"; statusEl.innerText = `Failed to load model: ${err.message}`;
+        }
+    });
+
+    container.addEventListener('contextmenu', e => e.preventDefault());
+
+    // Returns exact sub-pixel coordinates for anti-aliased drawing
+    function getFloatCoords(e) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: (e.clientX - rect.left) / rect.width * CANVAS_SIZE,
+            y: (e.clientY - rect.top) / rect.height * CANVAS_SIZE
+        };
+    }
+
+    function updateBrushOverlay(e) {
+        const coords = getFloatCoords(e);
+        const isEraser = (e.buttons === 2);
+        const activeWidth = isEraser ? ERASER_WIDTH : BRUSH_WIDTH;
+        
+        // Snap the overlay to the nearest pixel grid cell
+        const gridX = Math.floor(coords.x);
+        const gridY = Math.floor(coords.y);
+
+        // Center the cursor circle exactly over the pixel cell
+        const offset = activeWidth / 2;
+        
+        brushCursor.style.left = `${(gridX + 0.5 - offset) * SCALE}px`;
+        brushCursor.style.top = `${(gridY + 0.5 - offset) * SCALE}px`;
+        brushCursor.style.width = `${activeWidth * SCALE}px`;
+        brushCursor.style.height = `${activeWidth * SCALE}px`;
+        
+        if (isEraser) {
+            brushCursor.style.borderColor = "#f38ba8"; 
+            brushCursor.style.backgroundColor = "rgba(255, 255, 255, 0.6)"; 
+        } else {
+            brushCursor.style.borderColor = "rgba(0,0,0,0.9)";
+            brushCursor.style.backgroundColor = "rgba(0, 0, 0, 0.4)";
+        }
+    }
+
+    // Draws continuous, smooth, anti-aliased lines
+    function draw(e) {
+        if (!isDrawing) return;
+        const coords = getFloatCoords(e);
+        const isEraser = (e.buttons === 2);
+        
+        ctx.beginPath();
+        ctx.moveTo(lastX, lastY);
+        ctx.lineTo(coords.x, coords.y);
+        
+        ctx.strokeStyle = isEraser ? "white" : "black";
+        ctx.lineWidth = isEraser ? ERASER_WIDTH : BRUSH_WIDTH;
+        ctx.lineCap = "round"; 
+        ctx.lineJoin = "round";
+        ctx.stroke();
+
+        lastX = coords.x;
+        lastY = coords.y;
+        
+        runInferenceThrottled();
+    }
+
+    container.addEventListener('mouseenter', () => brushCursor.style.display = 'block');
+    container.addEventListener('mouseleave', () => { brushCursor.style.display = 'none'; isDrawing = false; });
+
+    canvas.addEventListener('mousemove', (e) => {
+        updateBrushOverlay(e);
+        draw(e);
+    });
+
+    canvas.addEventListener('mousedown', (e) => { 
+        isDrawing = true; 
+        updateBrushOverlay(e);
+        
+        const coords = getFloatCoords(e);
+        lastX = coords.x; 
+        lastY = coords.y;
+        
+        // Draw a single dot on click
+        const isEraser = (e.buttons === 2);
+        ctx.beginPath();
+        ctx.arc(coords.x, coords.y, (isEraser ? ERASER_WIDTH : BRUSH_WIDTH) / 2, 0, Math.PI * 2);
+        ctx.fillStyle = isEraser ? "white" : "black";
+        ctx.fill();
+        
+        runInferenceThrottled();
+    });
+    window.addEventListener('mouseup', () => isDrawing = false);
+
+    document.getElementById('clearBtn').addEventListener('click', () => {
+        ctx.fillStyle = "white"; ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE); resetUI();
+    });
+
+    function runInferenceThrottled() {
+        if (!session) return;
+        const now = performance.now();
+        if (now - lastInferenceTime < 41.6) return; 
+        lastInferenceTime = now;
+        runInference();
+    }
+
+    async function runInference() {
+        const imageData = ctx.getImageData(0, 0, CANVAS_SIZE, CANVAS_SIZE).data;
+        const float32Data = new Float32Array(CANVAS_SIZE * CANVAS_SIZE);
+        let isEmpty = true;
+        
+        for (let i = 0; i < CANVAS_SIZE * CANVAS_SIZE; i++) {
+            const pixelVal = imageData[i * 4]; 
+            let norm = (255 - pixelVal) / 255.0; 
+            norm = (norm - 0.5) / 0.5;
+            float32Data[i] = norm;
+            if (pixelVal < 250) isEmpty = false; 
+        }
+
+        if (isEmpty) { resetUI(); return; }
+
+        try {
+            const tensor = new ort.Tensor('float32', float32Data, [1, 1, CANVAS_SIZE, CANVAS_SIZE]);
+            const results = await session.run({ [session.inputNames[0]]: tensor });
+            const output = results[session.outputNames[0]].data;
+            const exps = Array.from(output).map(Math.exp);
+            const sumExps = exps.reduce((a, b) => a + b, 0);
+            const probs = exps.map(e => e / sumExps);
+
+            const top10 = probs.map((p, i) => ({ prob: p, char: CLASSES[i] }))
+                               .sort((a, b) => b.prob - a.prob).slice(0, 10);
+            updateUI(top10);
+        } catch (e) { console.error("Inference error:", e); }
+    }
+
+    function updateUI(top10) {
+        for(let i=0; i<10; i++) {
+            const item = top10[i];
+            const percent = (item.prob * 100).toFixed(1);
+            document.getElementById(`char-${i}`).innerText = item.char;
+            document.getElementById(`prob-${i}`).innerText = `${percent}%`;
+            document.getElementById(`prob-${i}`).style.opacity = item.prob > 0.01 ? 1 : 0;
+            document.getElementById(`bar-${i}`).style.height = `${Math.max(item.prob * 80, 2)}px`;
+            document.getElementById(`char-${i}`).style.color = i === 0 ? "var(--accent)" : "var(--text)";
+        }
+    }
+
+    function resetUI() {
+        for(let i=0; i<10; i++) {
+            document.getElementById(`char-${i}`).innerText = "-";
+            document.getElementById(`prob-${i}`).style.opacity = 0;
+            document.getElementById(`bar-${i}`).style.height = "0px";
+            document.getElementById(`char-${i}`).style.color = "var(--text)";
+        }
+    }
+</script>
+</body>
+</html>

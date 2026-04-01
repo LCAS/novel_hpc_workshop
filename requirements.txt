@@ -1,0 +1,10 @@
+tqdm
+onnx
+albumentations
+numpy
+matplotlib
+seaborn
+scikit-learn
+
+# wandb
+# neptune

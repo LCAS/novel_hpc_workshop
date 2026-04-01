@@ -1,0 +1,10 @@
+*_download_emnist.py
+*.png
+.venv/
+__pycache__/
+*.pyc
+checkpoints/
+data/
+*.onnx
+*.pt
+*.pth
